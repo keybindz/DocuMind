@@ -1,0 +1,106 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: documind
+      POSTGRES_PASSWORD: documind
+      POSTGRES_DB: documind
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Creates the restricted `documind_app` role (first start only).
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U documind"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:v1.11.3
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  # Settings shared by the API and the worker. Both connect as the RESTRICTED
+  # database role (so Row-Level Security applies to the worker too), and both
+  # need the same broker, storage volume and webhook policy.
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment: &app-env
+      # Never point DATABASE_URL at the owner/superuser: Postgres exempts
+      # superusers from RLS entirely.
+      DATABASE_URL: postgresql+psycopg2://documind_app:documind_app@postgres:5432/documind
+      MIGRATION_DATABASE_URL: postgresql+psycopg2://documind:documind@postgres:5432/documind
+      AUTO_CREATE_TABLES: "false"  # schema comes from Alembic (run on startup below)
+      SECRET_KEY: dev-secret-change-in-production
+      STORAGE_DIR: /data/storage
+      EMBEDDING_BACKEND: sentence-transformers
+      VECTOR_STORE_BACKEND: qdrant
+      QDRANT_URL: http://qdrant:6333
+      RATE_LIMIT_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+      TASK_QUEUE_BACKEND: celery
+      CELERY_BROKER_URL: redis://redis:6379/1
+      # DEV ONLY: lets you register a receiver on your own machine
+      # (http://host.docker.internal:9000/hook). In production leave this
+      # unset so webhook URLs pointing at private addresses are rejected (SSRF).
+      WEBHOOK_ALLOW_PRIVATE_URLS: "true"
+      # Optional: export ANTHROPIC_API_KEY before `docker compose up` to enable
+      # LLM answer synthesis on /v1/query. Unset -> retrieval only.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach a receiver running on the host (Linux)
+    volumes:
+      - ./app:/code/app          # live reload of source during dev
+      - storage_data:/data/storage
+      - st_model_cache:/root/.cache/torch
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  # Background worker: extract -> chunk -> embed documents, and deliver webhooks.
+  # Same image and code as the API; it shares the upload volume, so in a
+  # multi-host deployment storage must move to S3/MinIO first (Phase 5+).
+  worker:
+    build: .
+    environment: *app-env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./app:/code/app
+      - storage_data:/data/storage
+      - st_model_cache:/root/.cache/torch
+    depends_on:
+      api:
+        condition: service_started   # the API container runs the migrations
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=2
+
+volumes:
+  postgres_data:
+  storage_data:
+  qdrant_data:
+  st_model_cache:
